@@ -10,9 +10,10 @@ import logging
 import os
 from typing import Any
 
-import mcp.server.stdio
+import jsonschema
 import mcp.types as types
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
+from mcp.server.stdio import stdio_server
 
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -22,20 +23,6 @@ logging.basicConfig(
 
 from . import client  # noqa: E402
 
-server = Server(
-    "n8n-mcp-server",
-    instructions=(
-        "MCP-Server für selbst gehostetes n8n. Workflow-Lifecycle (CRUD + "
-        "activate/deactivate), Execution-Logs einsehen, Tags und Users.\n\n"
-        "Workflows werden als komplettes JSON-Objekt mit 'nodes' (Array) und "
-        "'connections' (Object) übergeben — siehe n8n REST API Docs. "
-        "Vor dem Erstellen am besten ein existierendes Workflow mit "
-        "n8n_get_workflow inspizieren um die Struktur zu lernen."
-    ),
-)
-
-
-@server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         # ── Workflows ─────────────────────────────────────────────────
@@ -45,7 +32,7 @@ async def list_tools() -> list[types.Tool]:
                 "Listet Workflows. Optional gefiltert nach active=true/false, "
                 "Tag-Namen (komma-separiert) oder Name (Substring)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "active": {"type": "boolean"},
@@ -58,7 +45,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_get_workflow",
             description="Voll-Details eines Workflows inkl. nodes + connections.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"workflow_id": {"type": "string"}},
                 "required": ["workflow_id"],
@@ -71,7 +58,7 @@ async def list_tools() -> list[types.Tool]:
                 "Objekt mit mindestens {name, nodes[], connections{}}. "
                 "Settings ist optional aber empfohlen."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "workflow": {
@@ -87,7 +74,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_update_workflow",
             description="Ersetzt einen Workflow vollständig (PUT-Semantik).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "workflow_id": {"type": "string"},
@@ -99,7 +86,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_delete_workflow",
             description="Löscht einen Workflow permanent.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"workflow_id": {"type": "string"}},
                 "required": ["workflow_id"],
@@ -108,7 +95,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_activate_workflow",
             description="Aktiviert einen Workflow (Trigger werden scharf geschaltet).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"workflow_id": {"type": "string"}},
                 "required": ["workflow_id"],
@@ -117,7 +104,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_deactivate_workflow",
             description="Deaktiviert einen Workflow.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"workflow_id": {"type": "string"}},
                 "required": ["workflow_id"],
@@ -130,7 +117,7 @@ async def list_tools() -> list[types.Tool]:
                 "Listet Workflow-Executions. Filter: workflow_id, status "
                 "('success', 'error', 'waiting', 'running')."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "workflow_id": {"type": "string"},
@@ -148,7 +135,7 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Volle Execution inkl. aller Node-Outputs (per Default mit Data)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "execution_id": {"type": "string"},
@@ -160,7 +147,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_delete_execution",
             description="Löscht eine Execution.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"execution_id": {"type": "string"}},
                 "required": ["execution_id"],
@@ -170,7 +157,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="n8n_list_tags",
             description="Listet alle Tags.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "default": 100}},
             },
@@ -182,17 +169,16 @@ async def list_tools() -> list[types.Tool]:
                 "Liefert KEINE tatsächlichen Credential-Werte (Secrets bleiben "
                 "in n8n)."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="n8n_list_users",
             description="Listet die n8n-User der Instanz.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
     ]
 
 
-@server.call_tool()
 async def call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[types.TextContent]:
@@ -249,13 +235,65 @@ async def _dispatch(name: str, a: dict[str, Any]) -> Any:
     raise ValueError(f"Unbekanntes Tool: {name}")
 
 
+async def _on_list_tools(
+    ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+def _error_result(text: str) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)], is_error=True
+    )
+
+
+async def _on_call_tool(
+    ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    """mcp 2.x prueft Argumente nicht mehr und wandelt Exceptions nicht mehr um."""
+    arguments = params.arguments or {}
+    tool = next((t for t in await list_tools() if t.name == params.name), None)
+    if tool is not None:
+        try:
+            jsonschema.validate(arguments, tool.input_schema)
+        except jsonschema.ValidationError as exc:
+            return _error_result(f"Input validation error: {exc.message}")
+    try:
+        content = await call_tool(params.name, arguments)
+    except Exception as exc:
+        return _error_result(str(exc))
+    return types.CallToolResult(content=content, is_error=False)
+
+
+server = Server(
+    "n8n-mcp-server",
+    instructions=(
+        "MCP-Server für selbst gehostetes n8n. Workflow-Lifecycle (CRUD + "
+        "activate/deactivate), Execution-Logs einsehen, Tags und Users.\n\n"
+        "Workflows werden als komplettes JSON-Objekt mit 'nodes' (Array) und "
+        "'connections' (Object) übergeben — siehe n8n REST API Docs. "
+        "Vor dem Erstellen am besten ein existierendes Workflow mit "
+        "n8n_get_workflow inspizieren um die Struktur zu lernen."
+    ),
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+)
+
+
 def main() -> None:
     import asyncio
 
     if os.getenv("MCP_TRANSPORT", "stdio") == "sse":
         _run_sse()
     else:
-        asyncio.run(mcp.server.stdio.run_server(server))
+        asyncio.run(_run_stdio())
+
+
+async def _run_stdio() -> None:
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream, write_stream, server.create_initialization_options()
+        )
 
 
 def _run_sse() -> None:
